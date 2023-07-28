@@ -1,0 +1,337 @@
+Description: CD12352 - Infrastructure as Code Project - Udagram
+
+Parameters:
+
+  ProjectName:
+    Type: String
+    Description: Tag name for our resources
+
+  UdagramKeyPair:
+    Type: String
+    Description: Key pair to connect to the EC2 instances
+
+  HomeIP:
+    Type: String
+    Description: Key pair to connect to the EC2 instances
+
+Resources:
+
+    # S3 bucket
+
+    WebAppBucket:
+        Type: AWS::S3::Bucket
+        Properties:
+            AccessControl: Private
+            BucketEncryption: 
+                ServerSideEncryptionConfiguration:
+                    - ServerSideEncryptionByDefault:
+                          SSEAlgorithm: AES256
+            BucketName: !Sub ${ProjectName}-data-storage
+            PublicAccessBlockConfiguration:
+                BlockPublicAcls: false
+                BlockPublicPolicy: false
+                IgnorePublicAcls: false
+                RestrictPublicBuckets: false
+            WebsiteConfiguration:
+                IndexDocument: index.html
+                ErrorDocument: error.html
+            Tags: 
+                - Key: Name
+                  Value: !Ref ProjectName
+
+    WebAppS3BucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        DependsOn: WebAppCloudfrontDistribution
+        Properties:
+            Bucket: !Ref WebAppBucket
+            PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                    - Sid: AllowOAIToGetObject
+                      Effect: 'Allow'
+                      Principal:
+                          CanonicalUser: !GetAtt WebAppCloudfrontOAI.S3CanonicalUserId
+                      Action:
+                          - 's3:GetObject'
+                      Resource: !Sub 'arn:aws:s3:::${WebAppBucket}/*'
+                    - Sid: AllowIAMRolePutObject
+                      Effect: 'Allow'
+                      Principal:
+                          AWS: !GetAtt WebAppIAMRole.Arn
+                      Action:
+                          - 's3:PutObject'
+                      Resource: !Sub 'arn:aws:s3:::${WebAppBucket}/*'
+
+    # IAM role and IAM instance profile
+
+    WebAppIAMRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                        Service:
+                            - ec2.amazonaws.com
+                      Action:
+                          - 'sts:AssumeRole'
+            Path: /
+            Policies:
+                - PolicyName: root
+                  PolicyDocument:
+                    Version: "2012-10-17"
+                    Statement:
+                      - Effect: Allow
+                        Action:
+                            - 's3:ListBucket'
+                            - 's3:GetObject'
+                            - 's3:PutObject'
+                            - 's3:DeleteObject'
+                        Resource:
+                            - !Sub 'arn:aws:s3:::${ProjectName}-data-storage/*'
+
+    WebAppInstanceProfile:
+        Type: AWS::IAM::InstanceProfile
+        Properties:
+            Path: /
+            Roles:
+                - !Ref WebAppIAMRole
+
+    # WebApp - Autoscaling group, launch template and security group
+
+    WebAppSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+          VpcId:
+              Fn::ImportValue:
+                  !Sub ${ProjectName}-VPCID
+          GroupDescription: Security group for WebApp servers
+          SecurityGroupIngress:
+              - IpProtocol: tcp
+                FromPort: 80
+                ToPort: 80
+                SourceSecurityGroupId: !Ref LBWebAppSecurityGroup
+              - IpProtocol: tcp
+                FromPort: 22
+                ToPort: 22
+                SourceSecurityGroupId: !Ref WebAppBastionSecurityGroup
+
+    WebAppLaunchTemplate:
+        Type: AWS::EC2::LaunchTemplate
+        Properties:
+            LaunchTemplateName: !Ref ProjectName
+            LaunchTemplateData:
+                ImageId: ami-03f65b8614a860c29
+                KeyName: !Ref UdagramKeyPair
+                IamInstanceProfile:
+                    Name: !Ref WebAppInstanceProfile
+                UserData:
+                    Fn::Base64: !Sub
+                        - |
+                            #!/bin/bash
+                            sudo apt-get update -y
+                            sudo apt-get install awscli -y
+                            sudo apt-get install nginx -y
+                            echo "<h1>It works! Udagram, Udacity</h1>" > /var/www/html/index.html
+                            aws s3 cp /var/www/html/index.html s3://${ProjectName}-data-storage/index.html
+                            if aws s3 ls s3://${ProjectName}-data-storage | grep -q 'index.html'; then
+                                echo "File exists in S3, no need to upload"
+                            else
+                                echo "File does not exist in S3, uploading now"
+                                aws s3 cp /var/www/html/index.html s3://${ProjectName}-data-storage/index.html
+                            fi
+                            service nginx start
+                        - ProjectName: !Ref ProjectName
+                SecurityGroupIds:
+                    - !Ref WebAppSecurityGroup
+                InstanceType: t2.micro
+                BlockDeviceMappings:
+                  - DeviceName: "/dev/sdk"
+                    Ebs:
+                      VolumeSize: '10'
+
+    WebAppAutoscalingGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties: 
+            AutoScalingGroupName: !Ref ProjectName
+            VPCZoneIdentifier: 
+                - Fn::ImportValue:
+                    !Sub ${ProjectName}-PRIV-SUBNETS
+            LaunchTemplate:
+                LaunchTemplateId: !Ref WebAppLaunchTemplate
+                Version: !GetAtt WebAppLaunchTemplate.LatestVersionNumber
+            MinSize: "4"
+            MaxSize: "4"
+            DesiredCapacity: "4"
+            TargetGroupARNs:
+                - Ref: WebAppTargetGroup
+
+    # Bastions - Autoscaling group, launch template and security group
+
+    WebAppBastionSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+          VpcId:
+              Fn::ImportValue:
+                  !Sub ${ProjectName}-VPCID
+          GroupDescription: Security group for WebApp servers
+          SecurityGroupIngress:
+              - IpProtocol: tcp
+                FromPort: 22
+                ToPort: 22
+                CidrIp: !Ref HomeIP
+
+    WebAppBastionLaunchTemplate:
+        Type: AWS::EC2::LaunchTemplate
+        Properties:
+            LaunchTemplateName: !Sub ${ProjectName}-Bastion
+            LaunchTemplateData:
+                ImageId: ami-03f65b8614a860c29
+                KeyName: !Ref UdagramKeyPair
+                NetworkInterfaces:
+                    - DeviceIndex: 0
+                      AssociatePublicIpAddress: true
+                      Groups:
+                          - !Ref WebAppBastionSecurityGroup
+                InstanceType: t2.micro
+                BlockDeviceMappings:
+                  - DeviceName: "/dev/sdk"
+                    Ebs:
+                      VolumeSize: '10'
+
+    WebAppBastionAutoscalingGroup:
+        Type: AWS::AutoScaling::AutoScalingGroup
+        Properties:
+            AutoScalingGroupName: !Sub ${ProjectName}-Bastion
+            VPCZoneIdentifier: 
+                - Fn::ImportValue:
+                    !Sub ${ProjectName}-PUB-SUBNETS
+            LaunchTemplate:
+                LaunchTemplateId: !Ref WebAppBastionLaunchTemplate
+                Version: !GetAtt WebAppBastionLaunchTemplate.LatestVersionNumber
+            MinSize: "2"
+            MaxSize: "2"
+            DesiredCapacity: "2"
+
+    # WebApp load balancer, security group listener, listener rule and target group
+
+    WebAppApplicationLoadBalancer:
+        Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+        Properties: 
+            Name: LB-WebApp
+            SecurityGroups: 
+                - Ref: LBWebAppSecurityGroup
+            Subnets: !Split
+                - ","
+                - Fn::ImportValue: !Sub ${ProjectName}-PUB-SUBNETS
+            Tags: 
+                - Key: Name
+                  Value: !Ref ProjectName
+
+    LBWebAppSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+          VpcId:
+              Fn::ImportValue:
+                  !Sub ${ProjectName}-VPCID
+          GroupDescription: Security group for WebApp servers
+          SecurityGroupIngress:
+              - IpProtocol: tcp
+                FromPort: 80
+                ToPort: 80
+                CidrIp: 0.0.0.0/0
+
+    WebAppApplicationLBListener:
+        Type: AWS::ElasticLoadBalancingV2::Listener
+        Properties:
+            DefaultActions:
+                - Type: forward
+                  TargetGroupArn: 
+                      Ref: WebAppTargetGroup
+            LoadBalancerArn:
+                Ref: WebAppApplicationLoadBalancer
+            Port: '80'
+            Protocol: HTTP
+
+    WebAppApplicationLBListenerRule:
+        Type: AWS::ElasticLoadBalancingV2::ListenerRule
+        Properties:
+            Actions:
+                - Type: forward
+                  TargetGroupArn: !Ref WebAppTargetGroup
+            Conditions:
+                - Field: path-pattern
+                  Values: [/]
+            ListenerArn: !Ref WebAppApplicationLBListener
+            Priority: 1
+
+    WebAppTargetGroup:
+        Type: AWS::ElasticLoadBalancingV2::TargetGroup
+        Properties:
+            HealthCheckIntervalSeconds: 12
+            HealthCheckPath: /
+            HealthCheckProtocol: HTTP
+            HealthCheckTimeoutSeconds: 10
+            HealthyThresholdCount: 2
+            Port: 80
+            Protocol: HTTP
+            UnhealthyThresholdCount: 5
+            VpcId: 
+                Fn::ImportValue:
+                    !Sub ${ProjectName}-VPCID
+
+    # Cloudfront distribution
+
+    WebAppCloudfrontOAI:
+        Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+        Properties:
+            CloudFrontOriginAccessIdentityConfig: 
+                Comment: Access S3 bucket content only through CloudFront
+
+    WebAppCloudfrontDistribution:
+        Type: AWS::CloudFront::Distribution
+        DependsOn: WebAppCloudfrontOAI
+        Properties:
+            DistributionConfig:
+                Origins:
+                    - DomainName: 
+                          Fn::GetAtt: [ WebAppBucket, DomainName ]
+                      Id: S3Origin
+                      S3OriginConfig:
+                          OriginAccessIdentity: !Sub origin-access-identity/cloudfront/${WebAppCloudfrontOAI}
+                Enabled: 'true'
+                DefaultCacheBehavior:
+                    AllowedMethods:
+                        - GET
+                        - HEAD
+                    Compress: 'true'
+                    TargetOriginId: S3Origin
+                    ViewerProtocolPolicy: allow-all
+                    ForwardedValues: 
+                        QueryString: 'false'
+                        Cookies: 
+                            Forward: 'none'
+                ViewerCertificate:
+                    CloudFrontDefaultCertificate: 'true'
+            Tags:
+                - Key: Name
+                  Value: !Ref ProjectName
+
+Outputs:
+
+    LoadBalancerURL:
+        Description: Load balancer URL
+        Value: !Sub 
+            - "http://${LoadBalancer}"
+            - LoadBalancer: !GetAtt WebAppApplicationLoadBalancer.DNSName
+        Export:
+            Name: !Sub ${ProjectName}-LB-URL
+
+    CloudFrontURL:
+        Description: CloudFront distribution URL
+        Value: !Sub
+            - "http://${CloudFront}/index.html"
+            - CloudFront: !GetAtt WebAppCloudfrontDistribution.DomainName
+        Export:
+            Name: !Sub ${ProjectName}-CF-URL

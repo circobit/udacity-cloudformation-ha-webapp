@@ -1,0 +1,14 @@
+[
+	{
+		"ParameterKey": "ProjectName",
+		"ParameterValue": "udagram"
+	},
+	{
+		"ParameterKey": "UdagramKeyPair",
+		"ParameterValue": "udagram-devops"
+	},
+	{
+		"ParameterKey": "HomeIP",
+		"ParameterValue": "79.225.234.128/32"
+	}
+]
